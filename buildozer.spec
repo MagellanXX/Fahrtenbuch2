@@ -4,7 +4,11 @@ package.name = fahrtenbuch
 package.domain = org.gpstracker.app
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
-version = 0.1
+version = 0.2
+
+# App Icon & Ladebildschirm
+icon.filename = icon.png
+presplash.filename = presplash.png
 
 requirements = python3,kivy==2.3.0,plyer
 

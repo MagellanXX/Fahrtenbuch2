@@ -39,13 +39,11 @@ def init_db():
     conn.close()
 
 def save_trip(start_time, end_time, dist_km, duration_str, avg_speed, max_speed, lat, lon):
-    if dist_km < 0.01:
-        return
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    s_time = datetime.datetime.fromtimestamp(start_time).strftime("%H:%M")
-    e_time = datetime.datetime.fromtimestamp(end_time).strftime("%H:%M")
+    s_time = datetime.datetime.fromtimestamp(start_time).strftime("%H:%M:%S")
+    e_time = datetime.datetime.fromtimestamp(end_time).strftime("%H:%M:%S")
     c.execute('''INSERT INTO trips 
                  (date, start_time, end_time, distance_km, duration_str, avg_speed, max_speed, lat, lon)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
@@ -76,8 +74,8 @@ class CardBox(BoxLayout):
             Color(*self.bg_color)
             RoundedRectangle(pos=self.pos, size=self.size, radius=[12])
 
-class LiveTrackRadar(Widget):
-    """Zeichnet den gefahrenen Weg als Vektorlinie auf einem dunklen Radar-Canvas"""
+class VisualRouteRadar(Widget):
+    """Zeichnet Live-Gitter und Fahrspur als Vektor mit Richtungszeiger"""
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.points = []
@@ -94,19 +92,28 @@ class LiveTrackRadar(Widget):
     def redraw(self, *args):
         self.canvas.clear()
         with self.canvas:
-            # Hintergrund
+            # Hintergrund Card
             Color(0.10, 0.12, 0.16, 1)
             RoundedRectangle(pos=self.pos, size=self.size, radius=[12])
-            
-            # Gitter-Linien
-            Color(0.2, 0.25, 0.35, 0.4)
-            Line(rectangle=(self.x + 5, self.y + 5, self.width - 10, self.height - 10), width=1)
-            Line(points=[self.x, self.center_y, self.right, self.center_y], width=1)
-            Line(points=[self.center_x, self.y, self.center_x, self.top], width=1)
 
-            if len(self.points) < 2:
-                # Punkt in der Mitte bei Start
-                Color(0.22, 0.65, 0.95, 1)
+            # Radar-Gitter
+            Color(0.18, 0.23, 0.32, 0.8)
+            Line(rectangle=(self.x + 8, self.y + 8, self.width - 16, self.height - 16), width=1.2)
+            Line(points=[self.x + 8, self.center_y, self.right - 8, self.center_y], width=1, dash_offset=4, dash_length=4)
+            Line(points=[self.center_x, self.y + 8, self.center_x, self.top - 8], width=1, dash_offset=4, dash_length=4)
+
+            # Radar-Kreise
+            Line(circle=(self.center_x, self.center_y, min(self.width, self.height) * 0.22), width=1)
+            Line(circle=(self.center_x, self.center_y, min(self.width, self.height) * 0.40), width=1)
+
+            if len(self.points) == 0:
+                # Standby Punkt
+                Color(0.9, 0.25, 0.28, 1)  # Akzent-Rot passend zum Logo
+                Ellipse(pos=(self.center_x - 6, self.center_y - 6), size=(12, 12))
+                return
+
+            if len(self.points) == 1:
+                Color(0.15, 0.78, 0.45, 1)
                 Ellipse(pos=(self.center_x - 6, self.center_y - 6), size=(12, 12))
                 return
 
@@ -118,7 +125,7 @@ class LiveTrackRadar(Widget):
             d_lat = max(max_lat - min_lat, 0.0001)
             d_lon = max(max_lon - min_lon, 0.0001)
 
-            pad = 20
+            pad = 22
             w = self.width - 2 * pad
             h = self.height - 2 * pad
 
@@ -128,15 +135,15 @@ class LiveTrackRadar(Widget):
                 py = self.y + pad + ((lat - min_lat) / d_lat) * h
                 canvas_pts.extend([px, py])
 
-            # Gefahrene Route als Leuchtlinie
-            Color(0.15, 0.78, 0.45, 1)
-            Line(points=canvas_pts, width=2.5)
+            # Gefahrene Route
+            Color(0.9, 0.25, 0.28, 1)  # MagellanX Rot
+            Line(points=canvas_pts, width=3.0)
 
             # Aktuelle Position
             Color(0.22, 0.65, 0.95, 1)
-            Ellipse(pos=(canvas_pts[-2] - 5, canvas_pts[-1] - 5), size=(10, 10))
+            Ellipse(pos=(canvas_pts[-2] - 6, canvas_pts[-1] - 6), size=(12, 12))
 
-# --- TRACKING LOGIK ---
+# --- TRACKING ENGINE ---
 class TrackerEngine:
     def __init__(self):
         self.is_tracking = False
@@ -194,7 +201,7 @@ class TrackerEngine:
 
         if self.last_lat is not None and self.last_lon is not None:
             d = self._haversine(self.last_lat, self.last_lon, lat, lon)
-            if d > 0.8:
+            if d > 0.5:
                 self.total_distance_m += d
 
         self.last_lat = lat
@@ -232,9 +239,9 @@ class DashboardScreen(Screen):
             self.bg = RoundedRectangle(pos=root.pos, size=root.size)
         root.bind(pos=lambda i, v: setattr(self.bg, 'pos', v), size=lambda i, v: setattr(self.bg, 'size', v))
 
-        # Navigationsleiste
+        # Top Bar
         nav_bar = BoxLayout(size_hint_y=0.08)
-        title = Label(text="FAHRTENBUCH", font_size='20sp', bold=True, color=(0.95, 0.96, 0.98, 1))
+        title = Label(text="MAGELLAN-X TRACKER", font_size='18sp', bold=True, color=(0.95, 0.96, 0.98, 1))
         btn_history = Button(text="Historie ➔", size_hint_x=0.35, font_size='13sp', bold=True,
                              background_normal='', background_color=(0.2, 0.25, 0.35, 1))
         btn_history.bind(on_press=self.go_to_history)
@@ -242,18 +249,18 @@ class DashboardScreen(Screen):
         nav_bar.add_widget(btn_history)
         root.add_widget(nav_bar)
 
-        # Tacho Card
+        # Tacho Kachel
         speed_card = CardBox(bg_color=(0.11, 0.14, 0.20, 1), size_hint_y=0.22, spacing=2)
-        lbl_speed_title = Label(text="AKTUELLES TEMPO", font_size='11sp', bold=True, color=(0.22, 0.65, 0.95, 1), size_hint_y=0.2)
-        self.val_speed = Label(text="0.0", font_size='46sp', bold=True, color=(1, 1, 1, 1), size_hint_y=0.6)
+        lbl_speed_title = Label(text="AKTUELLES TEMPO", font_size='11sp', bold=True, color=(0.9, 0.25, 0.28, 1), size_hint_y=0.2)
+        self.val_speed = Label(text="0.0", font_size='48sp', bold=True, color=(1, 1, 1, 1), size_hint_y=0.6)
         lbl_unit = Label(text="km/h", font_size='12sp', color=(0.5, 0.55, 0.65, 1), size_hint_y=0.2)
         speed_card.add_widget(lbl_speed_title)
         speed_card.add_widget(self.val_speed)
         speed_card.add_widget(lbl_unit)
         root.add_widget(speed_card)
 
-        # Live Track Radar (Visueller Routenverlauf)
-        self.radar = LiveTrackRadar(size_hint_y=0.30)
+        # Routen-Radar (Visuelle Streckenanzeige)
+        self.radar = VisualRouteRadar(size_hint_y=0.30)
         root.add_widget(self.radar)
 
         # 2x2 Kennzahlen
@@ -284,7 +291,7 @@ class DashboardScreen(Screen):
         grid.add_widget(c_max)
         root.add_widget(grid)
 
-        # Start/Stopp Button
+        # Start / Stopp
         self.btn_toggle = Button(text="STARTEN", font_size='18sp', bold=True, size_hint_y=0.12,
                                  background_normal='', background_color=(0.15, 0.78, 0.45, 1))
         self.btn_toggle.bind(on_press=self.toggle_tracking)
@@ -353,7 +360,7 @@ class HistoryScreen(Screen):
         trips = get_all_trips()
 
         if not trips:
-            empty_lbl = Label(text="Noch keine Fahrten aufgezeichnet.", color=(0.5, 0.55, 0.65, 1), size_hint_y=None, height=60)
+            empty_lbl = Label(text="Noch keine Fahrten gespeichert.", color=(0.5, 0.55, 0.65, 1), size_hint_y=None, height=60)
             self.scroll_layout.add_widget(empty_lbl)
             return
 
@@ -369,21 +376,20 @@ class HistoryScreen(Screen):
             if month_str != current_month:
                 current_month = month_str
                 m_header = Label(text=f"📅 {current_month}", font_size='15sp', bold=True,
-                                 color=(0.22, 0.65, 0.95, 1), size_hint_y=None, height=35)
+                                 color=(0.9, 0.25, 0.28, 1), size_hint_y=None, height=35)
                 self.scroll_layout.add_widget(m_header)
 
             card = CardBox(size_hint_y=None, height=80)
             line1 = BoxLayout()
-            line1.add_widget(Label(text=f"{date} ({s_time}-{e_time})", bold=True, font_size='13sp', color=(1, 1, 1, 1)))
+            line1.add_widget(Label(text=f"{date}  ({s_time} - {e_time})", bold=True, font_size='13sp', color=(1, 1, 1, 1)))
             line1.add_widget(Label(text=f"{dist:.2f} km", bold=True, font_size='15sp', color=(0.15, 0.78, 0.45, 1)))
 
             line2 = BoxLayout()
-            line2.add_widget(Label(text=f"Dauer: {dur}  |  Ø {avg_spd:.1f} km/h", font_size='11sp', color=(0.6, 0.65, 0.75, 1)))
+            line2.add_widget(Label(text=f"Dauer: {dur} | Ø {avg_spd:.1f} km/h", font_size='11sp', color=(0.6, 0.65, 0.75, 1)))
             
-            # 1-Klick Export nach Google Maps
             if lat and lon and lat != 0.0:
-                btn_map = Button(text="In Maps", size_hint_x=0.3, font_size='11sp',
-                                 background_normal='', background_color=(0.22, 0.65, 0.95, 0.8))
+                btn_map = Button(text="In Maps ➔", size_hint_x=0.32, font_size='11sp', bold=True,
+                                 background_normal='', background_color=(0.2, 0.55, 0.9, 0.85))
                 btn_map.bind(on_press=lambda inst, la=lat, lo=lon: webbrowser.open(f"https://www.google.com/maps/search/?api=1&query={la},{lo}"))
                 line2.add_widget(btn_map)
 
