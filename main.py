@@ -7,6 +7,7 @@ import webbrowser
 
 from kivy.app import App
 from kivy.clock import Clock
+from kivy.utils import platform
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
@@ -75,7 +76,6 @@ class CardBox(BoxLayout):
             RoundedRectangle(pos=self.pos, size=self.size, radius=[12])
 
 class VisualRouteRadar(Widget):
-    """Zeichnet Live-Gitter und Fahrspur als Vektor mit Richtungszeiger"""
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.points = []
@@ -92,23 +92,19 @@ class VisualRouteRadar(Widget):
     def redraw(self, *args):
         self.canvas.clear()
         with self.canvas:
-            # Hintergrund Card
             Color(0.10, 0.12, 0.16, 1)
             RoundedRectangle(pos=self.pos, size=self.size, radius=[12])
 
-            # Radar-Gitter
             Color(0.18, 0.23, 0.32, 0.8)
             Line(rectangle=(self.x + 8, self.y + 8, self.width - 16, self.height - 16), width=1.2)
             Line(points=[self.x + 8, self.center_y, self.right - 8, self.center_y], width=1, dash_offset=4, dash_length=4)
             Line(points=[self.center_x, self.y + 8, self.center_x, self.top - 8], width=1, dash_offset=4, dash_length=4)
 
-            # Radar-Kreise
             Line(circle=(self.center_x, self.center_y, min(self.width, self.height) * 0.22), width=1)
             Line(circle=(self.center_x, self.center_y, min(self.width, self.height) * 0.40), width=1)
 
             if len(self.points) == 0:
-                # Standby Punkt
-                Color(0.9, 0.25, 0.28, 1)  # Akzent-Rot passend zum Logo
+                Color(0.9, 0.25, 0.28, 1)
                 Ellipse(pos=(self.center_x - 6, self.center_y - 6), size=(12, 12))
                 return
 
@@ -135,11 +131,9 @@ class VisualRouteRadar(Widget):
                 py = self.y + pad + ((lat - min_lat) / d_lat) * h
                 canvas_pts.extend([px, py])
 
-            # Gefahrene Route
-            Color(0.9, 0.25, 0.28, 1)  # MagellanX Rot
+            Color(0.9, 0.25, 0.28, 1)
             Line(points=canvas_pts, width=3.0)
 
-            # Aktuelle Position
             Color(0.22, 0.65, 0.95, 1)
             Ellipse(pos=(canvas_pts[-2] - 6, canvas_pts[-1] - 6), size=(12, 12))
 
@@ -155,6 +149,7 @@ class TrackerEngine:
         self.total_distance_m = 0.0
         self.current_speed_kmh = 0.0
         self.max_speed_kmh = 0.0
+        self.gps_status_text = "GPS: Nicht initialisiert"
 
     def start(self):
         self.is_tracking = True
@@ -165,10 +160,11 @@ class TrackerEngine:
         self.last_lat = None
         self.last_lon = None
         try:
-            gps.configure(on_location=self.on_location)
-            gps.start(minTime=1000, minDistance=1)
+            gps.configure(on_location=self.on_location, on_status=self.on_status)
+            gps.start(minTime=500, minDistance=0.5)
+            self.gps_status_text = "GPS: Suche Satelliten..."
         except Exception as e:
-            print(f"GPS Init Error: {e}")
+            self.gps_status_text = f"GPS Fehler: {e}"
 
     def stop(self):
         if not self.is_tracking:
@@ -184,28 +180,44 @@ class TrackerEngine:
         save_trip(self.start_time, end_time, float(stats['dist_km']), stats['time_str'],
                   float(stats['avg_speed_kmh']), float(stats['max_speed_kmh']), self.current_lat, self.current_lon)
 
+    def on_status(self, general_status, status_message):
+        self.gps_status_text = f"GPS: {general_status}"
+
     def on_location(self, **kwargs):
-        lat = kwargs.get('lat')
-        lon = kwargs.get('lon')
-        speed_ms = kwargs.get('speed', 0.0)
+        try:
+            lat = float(kwargs.get('lat', 0.0))
+            lon = float(kwargs.get('lon', 0.0))
+            speed_val = kwargs.get('speed', None)
 
-        self.current_lat = lat
-        self.current_lon = lon
+            if lat == 0.0 and lon == 0.0:
+                return
 
-        if speed_ms is not None and speed_ms > 0:
-            self.current_speed_kmh = speed_ms * 3.6
+            self.current_lat = lat
+            self.current_lon = lon
+            self.gps_status_text = f"GPS: Empfang OK ({lat:.4f}, {lon:.4f})"
+
+            # Tempo berechnen (entweder direkt von Hardware-Sensor oder per Distanz/Zeit)
+            if speed_val is not None and float(speed_val) > 0:
+                self.current_speed_kmh = float(speed_val) * 3.6
+            else:
+                self.current_speed_kmh = 0.0
+
             if self.current_speed_kmh > self.max_speed_kmh:
                 self.max_speed_kmh = self.current_speed_kmh
-        else:
-            self.current_speed_kmh = 0.0
 
-        if self.last_lat is not None and self.last_lon is not None:
-            d = self._haversine(self.last_lat, self.last_lon, lat, lon)
-            if d > 0.5:
-                self.total_distance_m += d
+            # Distanz aufsummieren
+            if self.last_lat is not None and self.last_lon is not None:
+                d = self._haversine(self.last_lat, self.last_lon, lat, lon)
+                if d >= 1.0:  # Ab 1 Meter Bewegung zählen
+                    self.total_distance_m += d
+                    # Falls Sensor kein Speed lieferte, Tempo mathematisch ermitteln
+                    if speed_val is None or float(speed_val) <= 0:
+                        self.current_speed_kmh = (d / 1.0) * 3.6
 
-        self.last_lat = lat
-        self.last_lon = lon
+            self.last_lat = lat
+            self.last_lon = lon
+        except Exception as e:
+            self.gps_status_text = f"Datenfehler: {e}"
 
     def _haversine(self, lat1, lon1, lat2, lon2):
         r = 6371000
@@ -224,7 +236,8 @@ class TrackerEngine:
             "dist_km": f"{dist_km:.2f}",
             "speed_kmh": f"{self.current_speed_kmh:.1f}",
             "avg_speed_kmh": f"{avg_speed:.1f}",
-            "max_speed_kmh": f"{self.max_speed_kmh:.1f}"
+            "max_speed_kmh": f"{self.max_speed_kmh:.1f}",
+            "status": self.gps_status_text
         }
 
 # --- DASHBOARD SCREEN ---
@@ -239,7 +252,6 @@ class DashboardScreen(Screen):
             self.bg = RoundedRectangle(pos=root.pos, size=root.size)
         root.bind(pos=lambda i, v: setattr(self.bg, 'pos', v), size=lambda i, v: setattr(self.bg, 'size', v))
 
-        # Top Bar
         nav_bar = BoxLayout(size_hint_y=0.08)
         title = Label(text="MAGELLAN-X TRACKER", font_size='18sp', bold=True, color=(0.95, 0.96, 0.98, 1))
         btn_history = Button(text="Historie ➔", size_hint_x=0.35, font_size='13sp', bold=True,
@@ -249,21 +261,23 @@ class DashboardScreen(Screen):
         nav_bar.add_widget(btn_history)
         root.add_widget(nav_bar)
 
-        # Tacho Kachel
-        speed_card = CardBox(bg_color=(0.11, 0.14, 0.20, 1), size_hint_y=0.22, spacing=2)
+        # GPS Live Status Indikator
+        self.lbl_gps_status = Label(text="GPS: Initialisiere Berechtigungen...", font_size='11sp',
+                                    color=(0.9, 0.7, 0.2, 1), size_hint_y=0.04)
+        root.add_widget(self.lbl_gps_status)
+
+        speed_card = CardBox(bg_color=(0.11, 0.14, 0.20, 1), size_hint_y=0.20, spacing=2)
         lbl_speed_title = Label(text="AKTUELLES TEMPO", font_size='11sp', bold=True, color=(0.9, 0.25, 0.28, 1), size_hint_y=0.2)
-        self.val_speed = Label(text="0.0", font_size='48sp', bold=True, color=(1, 1, 1, 1), size_hint_y=0.6)
+        self.val_speed = Label(text="0.0", font_size='46sp', bold=True, color=(1, 1, 1, 1), size_hint_y=0.6)
         lbl_unit = Label(text="km/h", font_size='12sp', color=(0.5, 0.55, 0.65, 1), size_hint_y=0.2)
         speed_card.add_widget(lbl_speed_title)
         speed_card.add_widget(self.val_speed)
         speed_card.add_widget(lbl_unit)
         root.add_widget(speed_card)
 
-        # Routen-Radar (Visuelle Streckenanzeige)
-        self.radar = VisualRouteRadar(size_hint_y=0.30)
+        self.radar = VisualRouteRadar(size_hint_y=0.28)
         root.add_widget(self.radar)
 
-        # 2x2 Kennzahlen
         grid = GridLayout(cols=2, spacing=8, size_hint_y=0.24)
         c_dist = CardBox()
         c_dist.add_widget(Label(text="DISTANZ", font_size='10sp', bold=True, color=(0.55, 0.6, 0.7, 1), size_hint_y=0.3))
@@ -291,7 +305,6 @@ class DashboardScreen(Screen):
         grid.add_widget(c_max)
         root.add_widget(grid)
 
-        # Start / Stopp
         self.btn_toggle = Button(text="STARTEN", font_size='18sp', bold=True, size_hint_y=0.12,
                                  background_normal='', background_color=(0.15, 0.78, 0.45, 1))
         self.btn_toggle.bind(on_press=self.toggle_tracking)
@@ -312,8 +325,9 @@ class DashboardScreen(Screen):
             self.btn_toggle.background_color = (0.15, 0.78, 0.45, 1)
 
     def update_ui(self, dt):
+        stats = self.tracker.get_stats()
+        self.lbl_gps_status.text = stats['status']
         if self.tracker.is_tracking:
-            stats = self.tracker.get_stats()
             self.val_speed.text = stats['speed_kmh']
             self.val_dist.text = f"{stats['dist_km']} km"
             self.val_time.text = stats['time_str']
@@ -400,15 +414,30 @@ class HistoryScreen(Screen):
     def go_back(self, instance):
         self.manager.current = 'dashboard'
 
-# --- MAIN ---
+# --- MAIN APP MIT RUNTIME PERMISSIONS ---
 class GPSApp(App):
     def build(self):
         init_db()
-        tracker = TrackerEngine()
+        self.tracker = TrackerEngine()
+        
+        # Laufzeit-Berechtigungsdialog für Android anstoßen
+        if platform == 'android':
+            from android.permissions import request_permissions, Permission
+            request_permissions([
+                Permission.ACCESS_FINE_LOCATION,
+                Permission.ACCESS_COARSE_LOCATION
+            ], self.permission_callback)
+
         sm = ScreenManager()
-        sm.add_widget(DashboardScreen(tracker, name='dashboard'))
+        sm.add_widget(DashboardScreen(self.tracker, name='dashboard'))
         sm.add_widget(HistoryScreen(name='history'))
         return sm
+
+    def permission_callback(self, permissions, results):
+        if all([res for res in results]):
+            self.tracker.gps_status_text = "GPS: Berechtigung erteilt"
+        else:
+            self.tracker.gps_status_text = "GPS: Zugriff verweigert!"
 
 if __name__ == '__main__':
     GPSApp().run()
