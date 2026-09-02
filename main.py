@@ -6,7 +6,7 @@ import datetime
 import webbrowser
 
 from kivy.app import App
-from kivy.clock import Clock
+from kivy.clock import Clock, mainthread
 from kivy.utils import platform
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.gridlayout import GridLayout
@@ -16,7 +16,43 @@ from kivy.uix.widget import Widget
 from kivy.uix.recycleview import RecycleView
 from kivy.uix.screenmanager import ScreenManager, Screen
 from kivy.graphics import Color, RoundedRectangle, Line, Ellipse
-from plyer import gps
+
+# --- NATIVE ANDROID GPS IMPLEMENTIERUNG (PYJNIUS) ---
+if platform == 'android':
+    from jnius import autoclass, PythonJavaClass, java_method
+    from android.permissions import request_permissions, Permission
+
+    mActivity = autoclass('org.kivy.android.PythonActivity').mActivity
+    Context = autoclass('android.content.Context')
+    LocationManager = autoclass('android.location.LocationManager')
+    Looper = autoclass('android.os.Looper')
+
+    class NativeLocationListener(PythonJavaClass):
+        __javainterfaces__ = ['android/location/LocationListener']
+        __javacontext__ = 'app'
+
+        def __init__(self, callback):
+            super().__init__()
+            self.callback = callback
+
+        @java_method('(Landroid/location/Location;)V')
+        def onLocationChanged(self, location):
+            lat = location.getLatitude()
+            lon = location.getLongitude()
+            speed = location.getSpeed() if location.hasSpeed() else 0.0
+            self.callback(lat, lon, speed)
+
+        @java_method('(Ljava/lang/String;)V')
+        def onProviderDisabled(self, provider):
+            pass
+
+        @java_method('(Ljava/lang/String;)V')
+        def onProviderEnabled(self, provider):
+            pass
+
+        @java_method('(Ljava/lang/String;ILandroid/os/Bundle;)V')
+        def onStatusChanged(self, provider, status, extras):
+            pass
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "trips.db")
 
@@ -149,7 +185,9 @@ class TrackerEngine:
         self.total_distance_m = 0.0
         self.current_speed_kmh = 0.0
         self.max_speed_kmh = 0.0
-        self.gps_status_text = "GPS: Nicht initialisiert"
+        self.gps_status_text = "GPS: Bereit"
+        self.location_manager = None
+        self.native_listener = None
 
     def start(self):
         self.is_tracking = True
@@ -159,65 +197,67 @@ class TrackerEngine:
         self.max_speed_kmh = 0.0
         self.last_lat = None
         self.last_lon = None
-        try:
-            gps.configure(on_location=self.on_location, on_status=self.on_status)
-            gps.start(minTime=500, minDistance=0.5)
-            self.gps_status_text = "GPS: Suche Satelliten..."
-        except Exception as e:
-            self.gps_status_text = f"GPS Fehler: {e}"
+        self.gps_status_text = "GPS: Suche Satelliten..."
+
+        if platform == 'android':
+            try:
+                self.location_manager = mActivity.getSystemService(Context.LOCATION_SERVICE)
+                self.native_listener = NativeLocationListener(self.on_location_native)
+                # Beide Provider abfragen: GPS und Netzwerk/WLAN
+                for provider in [LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER]:
+                    if self.location_manager.isProviderEnabled(provider):
+                        self.location_manager.requestLocationUpdates(
+                            provider,
+                            1000,   # minTime: 1000 ms
+                            float(0.5),  # minDistance: 0.5 Meter
+                            self.native_listener,
+                            Looper.getMainLooper()
+                        )
+            except Exception as e:
+                self.gps_status_text = f"Hardware-Fehler: {e}"
 
     def stop(self):
         if not self.is_tracking:
             return
         self.is_tracking = False
         end_time = time.time()
-        try:
-            gps.stop()
-        except Exception:
-            pass
-        
+
+        if platform == 'android' and self.location_manager and self.native_listener:
+            try:
+                self.location_manager.removeUpdates(self.native_listener)
+            except Exception:
+                pass
+
         stats = self.get_stats()
         save_trip(self.start_time, end_time, float(stats['dist_km']), stats['time_str'],
                   float(stats['avg_speed_kmh']), float(stats['max_speed_kmh']), self.current_lat, self.current_lon)
+        self.gps_status_text = "Fahrt gespeichert!"
 
-    def on_status(self, general_status, status_message):
-        self.gps_status_text = f"GPS: {general_status}"
+    @mainthread
+    def on_location_native(self, lat, lon, speed_ms):
+        self.current_lat = lat
+        self.current_lon = lon
+        self.gps_status_text = f"GPS Fix: {lat:.4f}, {lon:.4f}"
 
-    def on_location(self, **kwargs):
-        try:
-            lat = float(kwargs.get('lat', 0.0))
-            lon = float(kwargs.get('lon', 0.0))
-            speed_val = kwargs.get('speed', None)
+        # Geschwindigkeit in km/h
+        if speed_ms > 0:
+            self.current_speed_kmh = speed_ms * 3.6
+        else:
+            self.current_speed_kmh = 0.0
 
-            if lat == 0.0 and lon == 0.0:
-                return
+        # Distanz berechnen
+        if self.last_lat is not None and self.last_lon is not None:
+            d = self._haversine(self.last_lat, self.last_lon, lat, lon)
+            if d >= 1.0:
+                self.total_distance_m += d
+                if speed_ms <= 0:
+                    self.current_speed_kmh = (d / 1.0) * 3.6
 
-            self.current_lat = lat
-            self.current_lon = lon
-            self.gps_status_text = f"GPS: Empfang OK ({lat:.4f}, {lon:.4f})"
+        if self.current_speed_kmh > self.max_speed_kmh:
+            self.max_speed_kmh = self.current_speed_kmh
 
-            # Tempo berechnen (entweder direkt von Hardware-Sensor oder per Distanz/Zeit)
-            if speed_val is not None and float(speed_val) > 0:
-                self.current_speed_kmh = float(speed_val) * 3.6
-            else:
-                self.current_speed_kmh = 0.0
-
-            if self.current_speed_kmh > self.max_speed_kmh:
-                self.max_speed_kmh = self.current_speed_kmh
-
-            # Distanz aufsummieren
-            if self.last_lat is not None and self.last_lon is not None:
-                d = self._haversine(self.last_lat, self.last_lon, lat, lon)
-                if d >= 1.0:  # Ab 1 Meter Bewegung zählen
-                    self.total_distance_m += d
-                    # Falls Sensor kein Speed lieferte, Tempo mathematisch ermitteln
-                    if speed_val is None or float(speed_val) <= 0:
-                        self.current_speed_kmh = (d / 1.0) * 3.6
-
-            self.last_lat = lat
-            self.last_lon = lon
-        except Exception as e:
-            self.gps_status_text = f"Datenfehler: {e}"
+        self.last_lat = lat
+        self.last_lon = lon
 
     def _haversine(self, lat1, lon1, lat2, lon2):
         r = 6371000
@@ -261,8 +301,7 @@ class DashboardScreen(Screen):
         nav_bar.add_widget(btn_history)
         root.add_widget(nav_bar)
 
-        # GPS Live Status Indikator
-        self.lbl_gps_status = Label(text="GPS: Initialisiere Berechtigungen...", font_size='11sp',
+        self.lbl_gps_status = Label(text="GPS: Initialisiere...", font_size='11sp',
                                     color=(0.9, 0.7, 0.2, 1), size_hint_y=0.04)
         root.add_widget(self.lbl_gps_status)
 
@@ -414,15 +453,13 @@ class HistoryScreen(Screen):
     def go_back(self, instance):
         self.manager.current = 'dashboard'
 
-# --- MAIN APP MIT RUNTIME PERMISSIONS ---
+# --- MAIN APP ---
 class GPSApp(App):
     def build(self):
         init_db()
         self.tracker = TrackerEngine()
         
-        # Laufzeit-Berechtigungsdialog für Android anstoßen
         if platform == 'android':
-            from android.permissions import request_permissions, Permission
             request_permissions([
                 Permission.ACCESS_FINE_LOCATION,
                 Permission.ACCESS_COARSE_LOCATION
@@ -435,7 +472,7 @@ class GPSApp(App):
 
     def permission_callback(self, permissions, results):
         if all([res for res in results]):
-            self.tracker.gps_status_text = "GPS: Berechtigung erteilt"
+            self.tracker.gps_status_text = "GPS: Bereit für Start"
         else:
             self.tracker.gps_status_text = "GPS: Zugriff verweigert!"
 
