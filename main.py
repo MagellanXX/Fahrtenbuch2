@@ -17,7 +17,7 @@ from kivy.uix.recycleview import RecycleView
 from kivy.uix.screenmanager import ScreenManager, Screen
 from kivy.graphics import Color, RoundedRectangle, Line, Ellipse
 
-# --- NATIVE ANDROID GPS IMPLEMENTIERUNG (PYJNIUS) ---
+# --- NATIVE ANDROID LOCATION LISTENER (PYJNIUS) ---
 if platform == 'android':
     from jnius import autoclass, PythonJavaClass, java_method
     from android.permissions import request_permissions, Permission
@@ -37,9 +37,9 @@ if platform == 'android':
 
         @java_method('(Landroid/location/Location;)V')
         def onLocationChanged(self, location):
-            lat = location.getLatitude()
-            lon = location.getLongitude()
-            speed = location.getSpeed() if location.hasSpeed() else 0.0
+            lat = float(location.getLatitude())
+            lon = float(location.getLongitude())
+            speed = float(location.getSpeed()) if location.hasSpeed() else 0.0
             self.callback(lat, lon, speed)
 
         @java_method('(Ljava/lang/String;)V')
@@ -56,7 +56,7 @@ if platform == 'android':
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "trips.db")
 
-# --- DATENBANK ---
+# --- SQLITE DATENBANK ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -173,13 +173,14 @@ class VisualRouteRadar(Widget):
             Color(0.22, 0.65, 0.95, 1)
             Ellipse(pos=(canvas_pts[-2] - 6, canvas_pts[-1] - 6), size=(12, 12))
 
-# --- TRACKING ENGINE ---
+# --- TRACKING ENGINE MIT NATIVEM ANDROID LOCATION MANAGER ---
 class TrackerEngine:
     def __init__(self):
         self.is_tracking = False
         self.start_time = None
         self.last_lat = None
         self.last_lon = None
+        self.last_time = None
         self.current_lat = 0.0
         self.current_lon = 0.0
         self.total_distance_m = 0.0
@@ -192,29 +193,55 @@ class TrackerEngine:
     def start(self):
         self.is_tracking = True
         self.start_time = time.time()
+        self.last_time = self.start_time
         self.total_distance_m = 0.0
         self.current_speed_kmh = 0.0
         self.max_speed_kmh = 0.0
         self.last_lat = None
         self.last_lon = None
-        self.gps_status_text = "GPS: Suche Satelliten..."
+        self.gps_status_text = "GPS: Suche Signal..."
 
         if platform == 'android':
             try:
                 self.location_manager = mActivity.getSystemService(Context.LOCATION_SERVICE)
                 self.native_listener = NativeLocationListener(self.on_location_native)
-                # Beide Provider abfragen: GPS und Netzwerk/WLAN
-                for provider in [LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER]:
-                    if self.location_manager.isProviderEnabled(provider):
-                        self.location_manager.requestLocationUpdates(
-                            provider,
-                            1000,   # minTime: 1000 ms
-                            float(0.5),  # minDistance: 0.5 Meter
-                            self.native_listener,
-                            Looper.getMainLooper()
-                        )
+
+                # Sofort-Fix: Letzten bekannten Standort aus den Caches abfragen
+                best_loc = None
+                providers = [LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER]
+                for prov in providers:
+                    try:
+                        if self.location_manager.isProviderEnabled(prov):
+                            loc = self.location_manager.getLastKnownLocation(prov)
+                            if loc is not None:
+                                if best_loc is None or loc.getTime() > best_loc.getTime():
+                                    best_loc = loc
+                    except Exception:
+                        pass
+
+                if best_loc is not None:
+                    self.current_lat = float(best_loc.getLatitude())
+                    self.current_lon = float(best_loc.getLongitude())
+                    self.last_lat = self.current_lat
+                    self.last_lon = self.current_lon
+                    self.gps_status_text = f"GPS Cache: {self.current_lat:.4f}, {self.current_lon:.4f}"
+
+                # Live-Updates für GPS und Netzwerk abonnieren
+                for prov in [LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER]:
+                    try:
+                        if self.location_manager.isProviderEnabled(prov):
+                            self.location_manager.requestLocationUpdates(
+                                prov,
+                                int(500),
+                                float(0.0),
+                                self.native_listener,
+                                Looper.getMainLooper()
+                            )
+                    except Exception as pe:
+                        print(f"Provider {prov} Fehler: {pe}")
+
             except Exception as e:
-                self.gps_status_text = f"Hardware-Fehler: {e}"
+                self.gps_status_text = f"Startfehler: {e}"
 
     def stop(self):
         if not self.is_tracking:
@@ -235,26 +262,37 @@ class TrackerEngine:
 
     @mainthread
     def on_location_native(self, lat, lon, speed_ms):
+        if not self.is_tracking:
+            return
+
+        now = time.time()
         self.current_lat = lat
         self.current_lon = lon
         self.gps_status_text = f"GPS Fix: {lat:.4f}, {lon:.4f}"
 
-        # Geschwindigkeit in km/h
-        if speed_ms > 0:
-            self.current_speed_kmh = speed_ms * 3.6
-        else:
-            self.current_speed_kmh = 0.0
+        dt = (now - self.last_time) if self.last_time else 1.0
+        self.last_time = now
 
-        # Distanz berechnen
+        # Distanz & Geschwindigkeitsberechnung
         if self.last_lat is not None and self.last_lon is not None:
             d = self._haversine(self.last_lat, self.last_lon, lat, lon)
-            if d >= 1.0:
+            if d >= 0.5:
                 self.total_distance_m += d
-                if speed_ms <= 0:
-                    self.current_speed_kmh = (d / 1.0) * 3.6
+                if speed_ms > 0:
+                    self.current_speed_kmh = speed_ms * 3.6
+                else:
+                    self.current_speed_kmh = (d / max(dt, 0.2)) * 3.6
 
-        if self.current_speed_kmh > self.max_speed_kmh:
-            self.max_speed_kmh = self.current_speed_kmh
+                if self.current_speed_kmh > self.max_speed_kmh:
+                    self.max_speed_kmh = self.current_speed_kmh
+            else:
+                if speed_ms > 0:
+                    self.current_speed_kmh = speed_ms * 3.6
+                else:
+                    self.current_speed_kmh = 0.0
+        else:
+            if speed_ms > 0:
+                self.current_speed_kmh = speed_ms * 3.6
 
         self.last_lat = lat
         self.last_lon = lon
@@ -301,7 +339,7 @@ class DashboardScreen(Screen):
         nav_bar.add_widget(btn_history)
         root.add_widget(nav_bar)
 
-        self.lbl_gps_status = Label(text="GPS: Initialisiere...", font_size='11sp',
+        self.lbl_gps_status = Label(text="GPS: Bereit", font_size='11sp',
                                     color=(0.9, 0.7, 0.2, 1), size_hint_y=0.04)
         root.add_widget(self.lbl_gps_status)
 
@@ -453,7 +491,7 @@ class HistoryScreen(Screen):
     def go_back(self, instance):
         self.manager.current = 'dashboard'
 
-# --- MAIN APP ---
+# --- MAIN APP MIT RUNTIME PERMISSIONS ---
 class GPSApp(App):
     def build(self):
         init_db()
