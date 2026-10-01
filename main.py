@@ -17,15 +17,47 @@ from kivy.uix.recycleview import RecycleView
 from kivy.uix.screenmanager import ScreenManager, Screen
 from kivy.graphics import Color, RoundedRectangle, Line, Ellipse
 
-# --- ANDROID IMPORTE ---
+# --- NATIVE ANDROID INTEGRATION & WAKELOCK ---
 if platform == 'android':
-    from jnius import autoclass
+    from jnius import autoclass, PythonJavaClass, java_method
     from android.permissions import request_permissions, Permission
 
-    PythonActivity = autoclass('org.kivy.android.PythonActivity')
+    mActivity = autoclass('org.kivy.android.PythonActivity').mActivity
     Context = autoclass('android.content.Context')
     LocationManager = autoclass('android.location.LocationManager')
     PowerManager = autoclass('android.os.PowerManager')
+    Looper = autoclass('android.os.Looper')
+
+    class NativeLocationListener(PythonJavaClass):
+        __javainterfaces__ = ['android/location/LocationListener']
+        __javacontext__ = 'app'
+
+        def __init__(self, callback):
+            super().__init__()
+            self.callback = callback
+
+        @java_method('(Landroid/location/Location;)V')
+        def onLocationChanged(self, location):
+            try:
+                lat = float(location.getLatitude())
+                lon = float(location.getLongitude())
+                speed = float(location.getSpeed()) if location.hasSpeed() else -1.0
+                acc = float(location.getAccuracy()) if location.hasAccuracy() else 999.0
+                self.callback(lat, lon, speed, acc)
+            except Exception as e:
+                print(f"Listener Error: {e}")
+
+        @java_method('(Ljava/lang/String;)V')
+        def onProviderDisabled(self, provider):
+            pass
+
+        @java_method('(Ljava/lang/String;)V')
+        def onProviderEnabled(self, provider):
+            pass
+
+        @java_method('(Ljava/lang/String;ILandroid/os/Bundle;)V')
+        def onStatusChanged(self, provider, status, extras):
+            pass
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "trips.db")
 
@@ -146,87 +178,62 @@ class VisualRouteRadar(Widget):
             Color(0.22, 0.65, 0.95, 1)
             Ellipse(pos=(canvas_pts[-2] - 6, canvas_pts[-1] - 6), size=(12, 12))
 
-# --- TRACKING ENGINE ---
+# --- TRACKING ENGINE MIT WAKELOCK & ECHTER HARDWARE-AUSWERTUNG ---
 class TrackerEngine:
     def __init__(self):
         self.is_tracking = False
         self.start_time = None
         self.last_lat = None
         self.last_lon = None
-        self.last_loc_time = 0
+        self.last_time = None
         self.current_lat = 0.0
         self.current_lon = 0.0
         self.total_distance_m = 0.0
         self.current_speed_kmh = 0.0
         self.max_speed_kmh = 0.0
         self.gps_status_text = "GPS: Bereit"
-        self.loc_mgr = None
+        self.location_manager = None
+        self.native_listener = None
         self.wake_lock = None
-        self.poll_event = None
 
     def start(self):
         self.is_tracking = True
         self.start_time = time.time()
+        self.last_time = self.start_time
         self.total_distance_m = 0.0
         self.current_speed_kmh = 0.0
         self.max_speed_kmh = 0.0
         self.last_lat = None
         self.last_lon = None
-        self.last_loc_time = 0
-        self.gps_status_text = "GPS: Initialisiere..."
+        self.gps_status_text = "GPS: Suche Fix..."
 
         if platform == 'android':
             try:
-                act = PythonActivity.mActivity
-                pm = act.getSystemService(Context.POWER_SERVICE)
+                # 1. WakeLock aktivieren (verhindert Standby bei Display aus)
+                pm = mActivity.getSystemService(Context.POWER_SERVICE)
                 self.wake_lock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MagellanX:TrackerLock")
                 self.wake_lock.acquire()
-                self.loc_mgr = act.getSystemService(Context.LOCATION_SERVICE)
+
+                # 2. Location Manager initialisieren
+                self.location_manager = mActivity.getSystemService(Context.LOCATION_SERVICE)
+                self.native_listener = NativeLocationListener(self.process_location)
+
+                # Priorisiere echten GPS-Sensor, nutze Netzwerk als Fallback
+                for prov in [LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER]:
+                    try:
+                        if self.location_manager.isProviderEnabled(prov):
+                            self.location_manager.requestLocationUpdates(
+                                prov,
+                                int(1000),      # minTime 1000 ms
+                                float(1.0),     # minDistance 1.0 Meter
+                                self.native_listener,
+                                Looper.getMainLooper()
+                            )
+                    except Exception as pe:
+                        print(f"Provider Error: {pe}")
+
             except Exception as e:
-                self.gps_status_text = f"Hardware-Fehler: {e}"
-
-        # Starte den regelmäßigen Abfrage-Takt (jede Sekunde)
-        self.poll_event = Clock.schedule_interval(self._poll_gps, 1.0)
-
-    def _poll_gps(self, dt):
-        if not self.is_tracking:
-            return
-
-        if platform != 'android':
-            # Simulation für Desktop-Tests
-            return
-
-        if not self.loc_mgr:
-            return
-
-        best_loc = None
-        # Alle Provider durchgehen
-        for prov in ["gps", "network", "passive"]:
-            try:
-                if self.loc_mgr.isProviderEnabled(prov):
-                    loc = self.loc_mgr.getLastKnownLocation(prov)
-                    if loc:
-                        if best_loc is None or loc.getTime() > best_loc.getTime():
-                            best_loc = loc
-            except Exception:
-                pass
-
-        if best_loc:
-            t = best_loc.getTime()
-            lat = float(best_loc.getLatitude())
-            lon = float(best_loc.getLongitude())
-            acc = float(best_loc.getAccuracy()) if best_loc.hasAccuracy() else 99.0
-            spd = float(best_loc.getSpeed()) if best_loc.hasSpeed() else -1.0
-
-            # Nur verarbeiten, wenn es ein neuer Datenpunkt ist
-            if t > self.last_loc_time:
-                self.last_loc_time = t
-                self.process_location(lat, lon, spd, acc)
-            else:
-                if self.current_lat == 0.0:
-                    self.current_lat = lat
-                    self.current_lon = lon
-                    self.gps_status_text = f"Standort erfasst (±{int(acc)}m)"
+                self.gps_status_text = f"Startfehler: {e}"
 
     def stop(self):
         if not self.is_tracking:
@@ -234,15 +241,17 @@ class TrackerEngine:
         self.is_tracking = False
         end_time = time.time()
 
-        if self.poll_event:
-            self.poll_event.cancel()
-            self.poll_event = None
-
-        if platform == 'android' and self.wake_lock and self.wake_lock.isHeld():
-            try:
-                self.wake_lock.release()
-            except Exception:
-                pass
+        if platform == 'android':
+            if self.location_manager and self.native_listener:
+                try:
+                    self.location_manager.removeUpdates(self.native_listener)
+                except Exception:
+                    pass
+            if self.wake_lock and self.wake_lock.isHeld():
+                try:
+                    self.wake_lock.release()
+                except Exception:
+                    pass
 
         stats = self.get_stats()
         save_trip(self.start_time, end_time, float(stats['dist_km']), stats['time_str'],
@@ -251,18 +260,31 @@ class TrackerEngine:
 
     @mainthread
     def process_location(self, lat, lon, speed_ms, accuracy):
+        if not self.is_tracking:
+            return
+
+        # Ungenaue Signale (> 35 Meter Abweichung) ignorieren
+        if accuracy > 35.0:
+            self.gps_status_text = f"Signal ungenau (±{int(accuracy)}m)"
+            return
+
+        now = time.time()
         self.current_lat = lat
         self.current_lon = lon
         self.gps_status_text = f"Live GPS: ±{int(accuracy)}m"
 
+        dt = (now - self.last_time) if self.last_time else 1.0
+        self.last_time = now
+
         if self.last_lat is not None and self.last_lon is not None:
             d = self._haversine(self.last_lat, self.last_lon, lat, lon)
-            if d >= 1.5:  # Ab 1.5 Meter Bewegung addieren
+            # Reale Bewegung ab 2 Metern zählen (vermeidet GPS-Jitter im Stand)
+            if d >= 2.0:
                 self.total_distance_m += d
                 if speed_ms >= 0:
                     self.current_speed_kmh = speed_ms * 3.6
                 else:
-                    self.current_speed_kmh = d * 3.6
+                    self.current_speed_kmh = (d / max(dt, 0.5)) * 3.6
 
                 if self.current_speed_kmh > self.max_speed_kmh:
                     self.max_speed_kmh = self.current_speed_kmh
@@ -469,7 +491,7 @@ class HistoryScreen(Screen):
     def go_back(self, instance):
         self.manager.current = 'dashboard'
 
-# --- MAIN APP ---
+# --- MAIN APP MIT RUNTIME PERMISSIONS & WAKELOCK ---
 class GPSApp(App):
     def build(self):
         init_db()
@@ -489,7 +511,7 @@ class GPSApp(App):
 
     def permission_callback(self, permissions, results):
         if all([res for res in results]):
-            self.tracker.gps_status_text = "GPS: Bereit"
+            self.tracker.gps_status_text = "GPS: Bereit für Start"
         else:
             self.tracker.gps_status_text = "GPS: Zugriff verweigert!"
 
