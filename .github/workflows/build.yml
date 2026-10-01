@@ -23,30 +23,29 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK Components
-        run: |
-          sdkmanager --install "platforms;android-33" "build-tools;33.0.2" "platform-tools"
-          yes | sdkmanager --licenses
-
       - name: Install System Dependencies
         run: |
           sudo apt update
           sudo apt install -y git zip unzip autoconf libtool pkg-config \
             zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev ccache
 
-      - name: Install Build Tools
+      - name: Install Android Platform & Build Tools
+        run: |
+          # Nutzt den im Ubuntu-Runner bereits vorinstallierten sdkmanager
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-33" "build-tools;33.0.2" "platform-tools"
+
+      - name: Install Python Tools
         run: |
           python3 -m pip install --upgrade pip setuptools wheel
           python3 -m pip install "cython<3.0" "buildozer==1.5.0"
 
       - name: Build APK with Buildozer
         run: |
-          python3 -m buildozer -v android debug
+          yes | python3 -m buildozer -v android debug
 
       - name: Upload APK Artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fahrtenbuch-apk
