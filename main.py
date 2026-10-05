@@ -12,10 +12,12 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
 from kivy.uix.button import Button
-from kivy.uix.widget import Widget
 from kivy.uix.recycleview import RecycleView
 from kivy.uix.screenmanager import ScreenManager, Screen
-from kivy.graphics import Color, RoundedRectangle, Line, Ellipse
+from kivy.graphics import Color, RoundedRectangle, Line
+
+# --- MAPVIEW IMPORT ---
+from kivy_garden.mapview import MapView, MapMarker, MapLayer
 
 # --- ANDROID IMPORTE (PYJNIUS) ---
 if platform == 'android':
@@ -85,69 +87,65 @@ class CardBox(BoxLayout):
             Color(*self.bg_color)
             RoundedRectangle(pos=self.pos, size=self.size, radius=[12])
 
-class VisualRouteRadar(Widget):
+# --- KARTEN-ROUTEN LAYER ---
+class RouteLineLayer(MapLayer):
+    """Zeichnet die gefahrene Spur direkt ueber die geladenen Kartenkacheln"""
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.points = []
-        self.bind(pos=self.redraw, size=self.redraw)
+        self.coordinates = []
 
-    def add_coordinate(self, lat, lon):
-        self.points.append((lat, lon))
-        self.redraw()
+    def add_point(self, lat, lon):
+        self.coordinates.append((lat, lon))
+        self.reposition()
 
-    def clear_track(self):
-        self.points = []
-        self.redraw()
+    def clear(self):
+        self.coordinates = []
+        self.canvas.clear()
 
-    def redraw(self, *args):
+    def reposition(self):
+        if len(self.coordinates) < 2:
+            self.canvas.clear()
+            return
+
+        mapview = self.parent
+        pts = []
+        for lat, lon in self.coordinates:
+            x, y = mapview.get_window_xy_from(lat, lon, mapview.zoom)
+            pts.extend([x, y])
+
         self.canvas.clear()
         with self.canvas:
-            Color(0.10, 0.12, 0.16, 1)
-            RoundedRectangle(pos=self.pos, size=self.size, radius=[12])
+            Color(0.9, 0.25, 0.28, 0.9)  # MagellanX Rot
+            Line(points=pts, width=3.5)
 
-            Color(0.18, 0.23, 0.32, 0.8)
-            Line(rectangle=(self.x + 8, self.y + 8, self.width - 16, self.height - 16), width=1.2)
-            Line(points=[self.x + 8, self.center_y, self.right - 8, self.center_y], width=1, dash_offset=4, dash_length=4)
-            Line(points=[self.center_x, self.y + 8, self.center_x, self.top - 8], width=1, dash_offset=4, dash_length=4)
+class LiveTrackingMap(MapView):
+    """Interaktive OpenStreetMap-Karte mit Live-Marker und Routenlinie"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.zoom = 15
+        self.lat = 53.33  # Standard-Startkoordinaten
+        self.lon = 8.48
+        self.current_marker = None
+        self.route_layer = RouteLineLayer()
+        self.add_layer(self.route_layer)
 
-            Line(circle=(self.center_x, self.center_y, min(self.width, self.height) * 0.22), width=1)
-            Line(circle=(self.center_x, self.center_y, min(self.width, self.height) * 0.40), width=1)
+    def update_position(self, lat, lon):
+        self.center_on(lat, lon)
+        if not self.current_marker:
+            self.current_marker = MapMarker(lat=lat, lon=lon)
+            self.add_marker(self.current_marker)
+        else:
+            self.current_marker.lat = lat
+            self.current_marker.lon = lon
+        self.route_layer.add_point(lat, lon)
 
-            if len(self.points) == 0:
-                Color(0.9, 0.25, 0.28, 1)
-                Ellipse(pos=(self.center_x - 6, self.center_y - 6), size=(12, 12))
-                return
+    def clear_route(self):
+        self.route_layer.clear()
+        if self.current_marker:
+            self.remove_marker(self.current_marker)
+            self.current_marker = None
 
-            if len(self.points) == 1:
-                Color(0.15, 0.78, 0.45, 1)
-                Ellipse(pos=(self.center_x - 6, self.center_y - 6), size=(12, 12))
-                return
-
-            lats = [p[0] for p in self.points]
-            lons = [p[1] for p in self.points]
-            min_lat, max_lat = min(lats), max(lats)
-            min_lon, max_lon = min(lons), max(lons)
-
-            d_lat = max(max_lat - min_lat, 0.0001)
-            d_lon = max(max_lon - min_lon, 0.0001)
-
-            pad = 22
-            w = self.width - 2 * pad
-            h = self.height - 2 * pad
-
-            canvas_pts = []
-            for lat, lon in self.points:
-                px = self.x + pad + ((lon - min_lon) / d_lon) * w
-                py = self.y + pad + ((lat - min_lat) / d_lat) * h
-                canvas_pts.extend([px, py])
-
-            Color(0.9, 0.25, 0.28, 1)
-            Line(points=canvas_pts, width=3.0)
-
-            Color(0.22, 0.65, 0.95, 1)
-            Ellipse(pos=(canvas_pts[-2] - 6, canvas_pts[-1] - 6), size=(12, 12))
-
-# --- TRACKING ENGINE MIT A-GPS SCHNELLSTART ---
+# --- TRACKING ENGINE ---
 class TrackerEngine:
     def __init__(self):
         self.is_tracking = False
@@ -184,7 +182,7 @@ class TrackerEngine:
                 self.wake_lock.acquire()
                 self.loc_mgr = act.getSystemService(Context.LOCATION_SERVICE)
 
-                # Sofortiger Kaltstart-Bypass: Letzte bekannte Position direkt laden
+                # Sofort-Fix aus Cache
                 best_loc = None
                 for prov in ["gps", "network", "passive"]:
                     try:
@@ -203,7 +201,7 @@ class TrackerEngine:
                     acc = float(best_loc.getAccuracy()) if best_loc.hasAccuracy() else 50.0
                     self.gps_status_text = f"Sofort-Fix (±{int(acc)}m)"
 
-                # Hardware aktiv anstoßen
+                # Hardware aktiv anfordern
                 for p in ["network", "gps"]:
                     try:
                         if self.loc_mgr.isProviderEnabled(p):
@@ -274,7 +272,7 @@ class TrackerEngine:
 
         self.current_lat = lat
         self.current_lon = lon
-        self.gps_status_text = f"Live Fix (±{int(accuracy)}m)"
+        self.gps_status_text = f"Live GPS: ±{int(accuracy)}m"
 
         if self.last_lat is not None and self.last_lon is not None:
             d = self._haversine(self.last_lat, self.last_lon, lat, lon)
@@ -351,10 +349,11 @@ class DashboardScreen(Screen):
         speed_card.add_widget(lbl_unit)
         root.add_widget(speed_card)
 
-        self.radar = VisualRouteRadar(size_hint_y=0.28)
-        root.add_widget(self.radar)
+        # ECHTE LIVE-STRASSENKARTE (OpenStreetMap via MapView)
+        self.live_map = LiveTrackingMap(size_hint_y=0.32)
+        root.add_widget(self.live_map)
 
-        grid = GridLayout(cols=2, spacing=8, size_hint_y=0.24)
+        grid = GridLayout(cols=2, spacing=8, size_hint_y=0.22)
         c_dist = CardBox()
         c_dist.add_widget(Label(text="DISTANZ", font_size='10sp', bold=True, color=(0.55, 0.6, 0.7, 1), size_hint_y=0.3))
         self.val_dist = Label(text="0.00 km", font_size='18sp', bold=True, color=(0.95, 0.95, 0.95, 1), size_hint_y=0.7)
@@ -391,7 +390,7 @@ class DashboardScreen(Screen):
 
     def toggle_tracking(self, instance):
         if not self.tracker.is_tracking:
-            self.radar.clear_track()
+            self.live_map.clear_route()
             self.tracker.start()
             self.btn_toggle.text = "STOPPEN & SPEICHERN"
             self.btn_toggle.background_color = (0.9, 0.25, 0.28, 1)
@@ -411,7 +410,7 @@ class DashboardScreen(Screen):
             self.val_max.text = f"{stats['max_speed_kmh']} km/h"
 
             if self.tracker.current_lat != 0.0:
-                self.radar.add_coordinate(self.tracker.current_lat, self.tracker.current_lon)
+                self.live_map.update_position(self.tracker.current_lat, self.tracker.current_lon)
 
     def go_to_history(self, instance):
         self.manager.get_screen('history').refresh_data()
@@ -490,7 +489,7 @@ class HistoryScreen(Screen):
     def go_back(self, instance):
         self.manager.current = 'dashboard'
 
-# --- MAIN APP MIT RUNTIME PERMISSIONS ---
+# --- MAIN APP ---
 class GPSApp(App):
     def build(self):
         init_db()
