@@ -20,7 +20,7 @@ from kivy_garden.mapview import MapView, MapMarker, MapLayer
 
 # --- NATIVE ANDROID INTEGRATION (PYJNIUS) ---
 if platform == 'android':
-    from jnius import autoclass
+    from jnius import autoclass, PythonJavaClass, java_method
     from android.permissions import request_permissions, Permission
 
     PythonActivity = autoclass('org.kivy.android.PythonActivity')
@@ -31,6 +31,37 @@ if platform == 'android':
     NotificationBuilder = autoclass('android.app.Notification$Builder')
     NotificationManager = autoclass('android.app.NotificationManager')
     NotificationChannel = autoclass('android.app.NotificationChannel')
+
+    class NativeUpdateListener(PythonJavaClass):
+        __javainterfaces__ = ['android/location/LocationListener']
+        __javacontext__ = 'app'
+
+        def __init__(self, callback):
+            super().__init__()
+            self.callback = callback
+
+        @java_method('(Landroid/location/Location;)V')
+        def onLocationChanged(self, location):
+            try:
+                lat = float(location.getLatitude())
+                lon = float(location.getLongitude())
+                spd = float(location.getSpeed()) if location.hasSpeed() else -1.0
+                acc = float(location.getAccuracy()) if location.hasAccuracy() else 99.0
+                self.callback(lat, lon, spd, acc)
+            except Exception:
+                pass
+
+        @java_method('(Ljava/lang/String;)V')
+        def onProviderDisabled(self, provider):
+            pass
+
+        @java_method('(Ljava/lang/String;)V')
+        def onProviderEnabled(self, provider):
+            pass
+
+        @java_method('(Ljava/lang/String;ILandroid/os/Bundle;)V')
+        def onStatusChanged(self, provider, status, extras):
+            pass
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "trips.db")
 
@@ -54,7 +85,6 @@ def init_db():
     conn.close()
 
 def create_trip_entry(start_time, lat, lon):
-    """Erstellt sofort zu Beginn der Fahrt einen Eintrag, damit nichts verloren geht"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -69,7 +99,6 @@ def create_trip_entry(start_time, lat, lon):
     return trip_id
 
 def update_trip_entry(trip_id, end_time, dist_km, duration_str, avg_speed, max_speed, lat, lon):
-    """Aktualisiert die Fahrt kontinuierlich im Hintergrund"""
     if not trip_id:
         return
     conn = sqlite3.connect(DB_FILE)
@@ -131,7 +160,7 @@ class RouteLineLayer(MapLayer):
 
         self.canvas.clear()
         with self.canvas:
-            Color(0.9, 0.25, 0.28, 0.9)
+            Color(0.9, 0.25, 0.28, 0.9)  # MagellanX Rot
             Line(points=pts, width=3.5)
 
 class LiveTrackingMap(MapView):
@@ -160,7 +189,7 @@ class LiveTrackingMap(MapView):
             self.remove_marker(self.current_marker)
             self.current_marker = None
 
-# --- TRACKING ENGINE MIT HINTERGRUND-SCHUTZ ---
+# --- TRACKING ENGINE ---
 class TrackerEngine:
     def __init__(self):
         self.is_tracking = False
@@ -177,6 +206,7 @@ class TrackerEngine:
         self.gps_status_text = "GPS: Bereit"
         self.loc_mgr = None
         self.wake_lock = None
+        self.native_listener = None
         self.poll_event = None
 
     def start(self):
@@ -190,44 +220,65 @@ class TrackerEngine:
         self.last_loc_time = 0
         self.gps_status_text = "GPS: Suche Signal..."
 
-        # 1. Sofort in der SQLite-Datenbank anlegen
         self.trip_id = create_trip_entry(self.start_time, self.current_lat, self.current_lon)
 
         if platform == 'android':
             try:
                 act = PythonActivity.mActivity
-                
-                # 2. Aggressiven WakeLock aktivieren
+
                 pm = act.getSystemService(Context.POWER_SERVICE)
                 self.wake_lock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MagellanX:TrackerLock")
                 self.wake_lock.acquire()
 
-                # 3. Android Statusleisten-Benachrichtigung (Foreground Notification) starten
                 channel_id = "magellanx_tracker"
                 notif_mgr = act.getSystemService(Context.NOTIFICATION_SERVICE)
                 channel = NotificationChannel(channel_id, "GPS Tracking Service", NotificationManager.IMPORTANCE_LOW)
                 notif_mgr.createNotificationChannel(channel)
                 builder = NotificationBuilder(act, channel_id)
                 builder.setContentTitle("MagellanX Tracker")
-                builder.setContentText("Streckenaufzeichnung laeuft im Hintergrund...")
+                builder.setContentText("Streckenaufzeichnung laeuft...")
                 builder.setSmallIcon(act.getApplicationInfo().icon)
                 builder.setOngoing(True)
                 notif_mgr.notify(101, builder.build())
 
-                # 4. Location Manager binden
                 self.loc_mgr = act.getSystemService(Context.LOCATION_SERVICE)
+                self.native_listener = NativeUpdateListener(self.process_location)
 
-                for p in ["network", "gps"]:
+                best_loc = None
+                for prov in ["gps", "network", "passive"]:
                     try:
-                        if self.loc_mgr.isProviderEnabled(p):
-                            self.loc_mgr.requestLocationUpdates(p, int(1000), float(0.0), None, Looper.getMainLooper())
+                        if self.loc_mgr.isProviderEnabled(prov):
+                            loc = self.loc_mgr.getLastKnownLocation(prov)
+                            if loc and (best_loc is None or loc.getTime() > best_loc.getTime()):
+                                best_loc = loc
                     except Exception:
                         pass
+
+                if best_loc:
+                    self.current_lat = float(best_loc.getLatitude())
+                    self.current_lon = float(best_loc.getLongitude())
+                    self.last_lat = self.current_lat
+                    self.last_lon = self.current_lon
+                    acc = float(best_loc.getAccuracy()) if best_loc.hasAccuracy() else 50.0
+                    self.gps_status_text = f"Live GPS: ±{int(acc)}m"
+
+                for p in ["gps", "network"]:
+                    try:
+                        if self.loc_mgr.isProviderEnabled(p):
+                            self.loc_mgr.requestLocationUpdates(
+                                p,
+                                int(1000),
+                                float(0.0),
+                                self.native_listener,
+                                Looper.getMainLooper()
+                            )
+                    except Exception as pe:
+                        print(f"Provider {p} Fehler: {pe}")
 
             except Exception as e:
                 self.gps_status_text = f"Sensor-Fehler: {e}"
 
-        self.poll_event = Clock.schedule_interval(self._poll_gps, 0.5)
+        self.poll_event = Clock.schedule_interval(self._poll_gps, 1.0)
 
     def _poll_gps(self, dt):
         if not self.is_tracking or platform != 'android' or not self.loc_mgr:
@@ -239,9 +290,7 @@ class TrackerEngine:
                 if self.loc_mgr.isProviderEnabled(prov):
                     loc = self.loc_mgr.getLastKnownLocation(prov)
                     if loc:
-                        if best_loc is None or (prov == "gps" and loc.hasAccuracy() and loc.getAccuracy() < 25.0):
-                            best_loc = loc
-                        elif loc.getTime() > best_loc.getTime():
+                        if best_loc is None or loc.getTime() > best_loc.getTime():
                             best_loc = loc
             except Exception:
                 pass
@@ -256,8 +305,6 @@ class TrackerEngine:
             if t > self.last_loc_time:
                 self.last_loc_time = t
                 self.process_location(lat, lon, spd, acc)
-            elif self.current_lat == 0.0:
-                self.process_location(lat, lon, spd, acc)
 
     def stop(self):
         if not self.is_tracking:
@@ -270,13 +317,18 @@ class TrackerEngine:
             self.poll_event = None
 
         if platform == 'android':
-            # WakeLock freigeben
+            if self.loc_mgr and self.native_listener:
+                try:
+                    self.loc_mgr.removeUpdates(self.native_listener)
+                except Exception:
+                    pass
+
             if self.wake_lock and self.wake_lock.isHeld():
                 try:
                     self.wake_lock.release()
                 except Exception:
                     pass
-            # Benachrichtigung entfernen
+
             try:
                 act = PythonActivity.mActivity
                 notif_mgr = act.getSystemService(Context.NOTIFICATION_SERVICE)
@@ -285,7 +337,6 @@ class TrackerEngine:
                 pass
 
         stats = self.get_stats()
-        # Letzte Aktualisierung in die DB
         update_trip_entry(self.trip_id, end_time, float(stats['dist_km']), stats['time_str'],
                           float(stats['avg_speed_kmh']), float(stats['max_speed_kmh']), self.current_lat, self.current_lon)
         self.gps_status_text = "Fahrt gespeichert!"
@@ -295,6 +346,7 @@ class TrackerEngine:
         if accuracy > 80.0:
             return
 
+        now = time.time()
         self.current_lat = lat
         self.current_lon = lon
         self.gps_status_text = f"Live GPS: ±{int(accuracy)}m"
@@ -311,9 +363,8 @@ class TrackerEngine:
                 if self.current_speed_kmh > self.max_speed_kmh:
                     self.max_speed_kmh = self.current_speed_kmh
 
-                # AUTO-SAVE: Kontinuierlich jeden Meter in die Datenbank sichern
                 stats = self.get_stats()
-                update_trip_entry(self.trip_id, time.time(), float(stats['dist_km']), stats['time_str'],
+                update_trip_entry(self.trip_id, now, float(stats['dist_km']), stats['time_str'],
                                   float(stats['avg_speed_kmh']), float(stats['max_speed_kmh']), self.current_lat, self.current_lon)
             else:
                 self.current_speed_kmh = 0.0
@@ -400,146 +451,4 @@ class DashboardScreen(Screen):
 
         c_max = CardBox()
         c_max.add_widget(Label(text="MAX TEMPO", font_size='10sp', bold=True, color=(0.55, 0.6, 0.7, 1), size_hint_y=0.3))
-        self.val_max = Label(text="0.0 km/h", font_size='17sp', bold=True, color=(0.95, 0.95, 0.95, 1), size_hint_y=0.7)
-        c_max.add_widget(self.val_max)
-
-        grid.add_widget(c_dist)
-        grid.add_widget(c_time)
-        grid.add_widget(c_avg)
-        grid.add_widget(c_max)
-        root.add_widget(grid)
-
-        self.btn_toggle = Button(text="STARTEN", font_size='18sp', bold=True, size_hint_y=0.12,
-                                 background_normal='', background_color=(0.15, 0.78, 0.45, 1))
-        self.btn_toggle.bind(on_press=self.toggle_tracking)
-        root.add_widget(self.btn_toggle)
-
-        self.add_widget(root)
-        Clock.schedule_interval(self.update_ui, 0.5)
-
-    def toggle_tracking(self, instance):
-        if not self.tracker.is_tracking:
-            self.live_map.clear_route()
-            self.tracker.start()
-            self.btn_toggle.text = "STOPPEN & SPEICHERN"
-            self.btn_toggle.background_color = (0.9, 0.25, 0.28, 1)
-        else:
-            self.tracker.stop()
-            self.btn_toggle.text = "STARTEN"
-            self.btn_toggle.background_color = (0.15, 0.78, 0.45, 1)
-
-    def update_ui(self, dt):
-        stats = self.tracker.get_stats()
-        self.lbl_gps_status.text = stats['status']
-        if self.tracker.is_tracking:
-            self.val_speed.text = stats['speed_kmh']
-            self.val_dist.text = f"{stats['dist_km']} km"
-            self.val_time.text = stats['time_str']
-            self.val_avg.text = f"{stats['avg_speed_kmh']} km/h"
-            self.val_max.text = f"{stats['max_speed_kmh']} km/h"
-
-            if self.tracker.current_lat != 0.0:
-                self.live_map.update_position(self.tracker.current_lat, self.tracker.current_lon)
-
-    def go_to_history(self, instance):
-        self.manager.get_screen('history').refresh_data()
-        self.manager.current = 'history'
-
-# --- HISTORIE SCREEN ---
-class HistoryScreen(Screen):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.root_box = BoxLayout(orientation='vertical', padding=14, spacing=10)
-        with self.root_box.canvas.before:
-            Color(0.07, 0.08, 0.11, 1)
-            self.bg = RoundedRectangle(pos=self.root_box.pos, size=self.root_box.size)
-        self.root_box.bind(pos=lambda i, v: setattr(self.bg, 'pos', v), size=lambda i, v: setattr(self.bg, 'size', v))
-
-        nav_bar = BoxLayout(size_hint_y=0.08)
-        btn_back = Button(text="⬅ Zurück", size_hint_x=0.3, font_size='13sp', bold=True,
-                          background_normal='', background_color=(0.2, 0.25, 0.35, 1))
-        btn_back.bind(on_press=self.go_back)
-        title = Label(text="FAHRTEN-HISTORIE", font_size='18sp', bold=True, color=(0.95, 0.96, 0.98, 1))
-        nav_bar.add_widget(btn_back)
-        nav_bar.add_widget(title)
-        self.root_box.add_widget(nav_bar)
-
-        self.scroll_layout = GridLayout(cols=1, spacing=10, size_hint_y=None)
-        self.scroll_layout.bind(minimum_height=self.scroll_layout.setter('height'))
-
-        self.rv = RecycleView(size_hint_y=0.92)
-        self.rv.add_widget(self.scroll_layout)
-        self.root_box.add_widget(self.rv)
-
-        self.add_widget(self.root_box)
-
-    def refresh_data(self):
-        self.scroll_layout.clear_widgets()
-        trips = get_all_trips()
-
-        if not trips:
-            empty_lbl = Label(text="Noch keine Fahrten gespeichert.", color=(0.5, 0.55, 0.65, 1), size_hint_y=None, height=60)
-            self.scroll_layout.add_widget(empty_lbl)
-            return
-
-        current_month = None
-        for trip in trips:
-            date, s_time, e_time, dist, dur, avg_spd, max_spd, lat, lon = trip
-            try:
-                t_obj = datetime.datetime.strptime(date, "%Y-%m-%d")
-                month_str = t_obj.strftime("%B %Y")
-            except Exception:
-                month_str = date
-
-            if month_str != current_month:
-                current_month = month_str
-                m_header = Label(text=f"📅 {current_month}", font_size='15sp', bold=True,
-                                 color=(0.9, 0.25, 0.28, 1), size_hint_y=None, height=35)
-                self.scroll_layout.add_widget(m_header)
-
-            card = CardBox(size_hint_y=None, height=80)
-            line1 = BoxLayout()
-            line1.add_widget(Label(text=f"{date}  ({s_time} - {e_time})", bold=True, font_size='13sp', color=(1, 1, 1, 1)))
-            line1.add_widget(Label(text=f"{dist:.2f} km", bold=True, font_size='15sp', color=(0.15, 0.78, 0.45, 1)))
-
-            line2 = BoxLayout()
-            line2.add_widget(Label(text=f"Dauer: {dur} | Ø {avg_spd:.1f} km/h", font_size='11sp', color=(0.6, 0.65, 0.75, 1)))
-            
-            if lat and lon and lat != 0.0:
-                btn_map = Button(text="In Maps ➔", size_hint_x=0.32, font_size='11sp', bold=True,
-                                 background_normal='', background_color=(0.2, 0.55, 0.9, 0.85))
-                btn_map.bind(on_press=lambda inst, la=lat, lo=lon: webbrowser.open(f"https://www.google.com/maps/search/?api=1&query={la},{lo}"))
-                line2.add_widget(btn_map)
-
-            card.add_widget(line1)
-            card.add_widget(line2)
-            self.scroll_layout.add_widget(card)
-
-    def go_back(self, instance):
-        self.manager.current = 'dashboard'
-
-# --- MAIN APP ---
-class GPSApp(App):
-    def build(self):
-        init_db()
-        self.tracker = TrackerEngine()
-
-        if platform == 'android':
-            request_permissions([
-                Permission.ACCESS_FINE_LOCATION,
-                Permission.ACCESS_COARSE_LOCATION
-            ], self.permission_callback)
-
-        sm = ScreenManager()
-        sm.add_widget(DashboardScreen(self.tracker, name='dashboard'))
-        sm.add_widget(HistoryScreen(name='history'))
-        return sm
-
-    def permission_callback(self, permissions, results):
-        if all([res for res in results]):
-            self.tracker.gps_status_text = "GPS: Bereit"
-        else:
-            self.tracker.gps_status_text = "GPS: Zugriff verweigert!"
-
-if __name__ == '__main__':
-    GPSApp().run()
+        self.val
