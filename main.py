@@ -16,10 +16,9 @@ from kivy.uix.recycleview import RecycleView
 from kivy.uix.screenmanager import ScreenManager, Screen
 from kivy.graphics import Color, RoundedRectangle, Line
 
-# --- MAPVIEW IMPORT ---
 from kivy_garden.mapview import MapView, MapMarker, MapLayer
 
-# --- ANDROID IMPORTE (PYJNIUS) ---
+# --- NATIVE ANDROID INTEGRATION (PYJNIUS) ---
 if platform == 'android':
     from jnius import autoclass
     from android.permissions import request_permissions, Permission
@@ -29,10 +28,13 @@ if platform == 'android':
     LocationManager = autoclass('android.location.LocationManager')
     PowerManager = autoclass('android.os.PowerManager')
     Looper = autoclass('android.os.Looper')
+    NotificationBuilder = autoclass('android.app.Notification$Builder')
+    NotificationManager = autoclass('android.app.NotificationManager')
+    NotificationChannel = autoclass('android.app.NotificationChannel')
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "trips.db")
 
-# --- SQLITE DATENBANK ---
+# --- SQLITE DATENBANK MIT TRANSAKTIONSSICHERHEIT ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -51,16 +53,32 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_trip(start_time, end_time, dist_km, duration_str, avg_speed, max_speed, lat, lon):
+def create_trip_entry(start_time, lat, lon):
+    """Erstellt sofort zu Beginn der Fahrt einen Eintrag, damit nichts verloren geht"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
     s_time = datetime.datetime.fromtimestamp(start_time).strftime("%H:%M:%S")
-    e_time = datetime.datetime.fromtimestamp(end_time).strftime("%H:%M:%S")
     c.execute('''INSERT INTO trips 
                  (date, start_time, end_time, distance_km, duration_str, avg_speed, max_speed, lat, lon)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-              (date_str, s_time, e_time, dist_km, duration_str, avg_speed, max_speed, lat, lon))
+              (date_str, s_time, s_time, 0.0, "00:00:00", 0.0, 0.0, lat, lon))
+    trip_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return trip_id
+
+def update_trip_entry(trip_id, end_time, dist_km, duration_str, avg_speed, max_speed, lat, lon):
+    """Aktualisiert die Fahrt kontinuierlich im Hintergrund"""
+    if not trip_id:
+        return
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    e_time = datetime.datetime.fromtimestamp(end_time).strftime("%H:%M:%S")
+    c.execute('''UPDATE trips SET 
+                 end_time = ?, distance_km = ?, duration_str = ?, avg_speed = ?, max_speed = ?, lat = ?, lon = ?
+                 WHERE id = ?''',
+              (e_time, dist_km, duration_str, avg_speed, max_speed, lat, lon, trip_id))
     conn.commit()
     conn.close()
 
@@ -87,9 +105,7 @@ class CardBox(BoxLayout):
             Color(*self.bg_color)
             RoundedRectangle(pos=self.pos, size=self.size, radius=[12])
 
-# --- KARTEN-ROUTEN LAYER ---
 class RouteLineLayer(MapLayer):
-    """Zeichnet die gefahrene Spur direkt ueber die geladenen Kartenkacheln"""
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.coordinates = []
@@ -115,15 +131,14 @@ class RouteLineLayer(MapLayer):
 
         self.canvas.clear()
         with self.canvas:
-            Color(0.9, 0.25, 0.28, 0.9)  # MagellanX Rot
+            Color(0.9, 0.25, 0.28, 0.9)
             Line(points=pts, width=3.5)
 
 class LiveTrackingMap(MapView):
-    """Interaktive OpenStreetMap-Karte mit Live-Marker und Routenlinie"""
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.zoom = 15
-        self.lat = 53.33  # Standard-Startkoordinaten
+        self.lat = 53.33
         self.lon = 8.48
         self.current_marker = None
         self.route_layer = RouteLineLayer()
@@ -145,10 +160,11 @@ class LiveTrackingMap(MapView):
             self.remove_marker(self.current_marker)
             self.current_marker = None
 
-# --- TRACKING ENGINE ---
+# --- TRACKING ENGINE MIT HINTERGRUND-SCHUTZ ---
 class TrackerEngine:
     def __init__(self):
         self.is_tracking = False
+        self.trip_id = None
         self.start_time = None
         self.last_lat = None
         self.last_lon = None
@@ -174,34 +190,33 @@ class TrackerEngine:
         self.last_loc_time = 0
         self.gps_status_text = "GPS: Suche Signal..."
 
+        # 1. Sofort in der SQLite-Datenbank anlegen
+        self.trip_id = create_trip_entry(self.start_time, self.current_lat, self.current_lon)
+
         if platform == 'android':
             try:
                 act = PythonActivity.mActivity
+                
+                # 2. Aggressiven WakeLock aktivieren
                 pm = act.getSystemService(Context.POWER_SERVICE)
                 self.wake_lock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MagellanX:TrackerLock")
                 self.wake_lock.acquire()
+
+                # 3. Android Statusleisten-Benachrichtigung (Foreground Notification) starten
+                channel_id = "magellanx_tracker"
+                notif_mgr = act.getSystemService(Context.NOTIFICATION_SERVICE)
+                channel = NotificationChannel(channel_id, "GPS Tracking Service", NotificationManager.IMPORTANCE_LOW)
+                notif_mgr.createNotificationChannel(channel)
+                builder = NotificationBuilder(act, channel_id)
+                builder.setContentTitle("MagellanX Tracker")
+                builder.setContentText("Streckenaufzeichnung laeuft im Hintergrund...")
+                builder.setSmallIcon(act.getApplicationInfo().icon)
+                builder.setOngoing(True)
+                notif_mgr.notify(101, builder.build())
+
+                # 4. Location Manager binden
                 self.loc_mgr = act.getSystemService(Context.LOCATION_SERVICE)
 
-                # Sofort-Fix aus Cache
-                best_loc = None
-                for prov in ["gps", "network", "passive"]:
-                    try:
-                        if self.loc_mgr.isProviderEnabled(prov):
-                            loc = self.loc_mgr.getLastKnownLocation(prov)
-                            if loc and (best_loc is None or loc.getTime() > best_loc.getTime()):
-                                best_loc = loc
-                    except Exception:
-                        pass
-
-                if best_loc:
-                    self.current_lat = float(best_loc.getLatitude())
-                    self.current_lon = float(best_loc.getLongitude())
-                    self.last_lat = self.current_lat
-                    self.last_lon = self.current_lon
-                    acc = float(best_loc.getAccuracy()) if best_loc.hasAccuracy() else 50.0
-                    self.gps_status_text = f"Sofort-Fix (±{int(acc)}m)"
-
-                # Hardware aktiv anfordern
                 for p in ["network", "gps"]:
                     try:
                         if self.loc_mgr.isProviderEnabled(p):
@@ -254,15 +269,25 @@ class TrackerEngine:
             self.poll_event.cancel()
             self.poll_event = None
 
-        if platform == 'android' and self.wake_lock and self.wake_lock.isHeld():
+        if platform == 'android':
+            # WakeLock freigeben
+            if self.wake_lock and self.wake_lock.isHeld():
+                try:
+                    self.wake_lock.release()
+                except Exception:
+                    pass
+            # Benachrichtigung entfernen
             try:
-                self.wake_lock.release()
+                act = PythonActivity.mActivity
+                notif_mgr = act.getSystemService(Context.NOTIFICATION_SERVICE)
+                notif_mgr.cancel(101)
             except Exception:
                 pass
 
         stats = self.get_stats()
-        save_trip(self.start_time, end_time, float(stats['dist_km']), stats['time_str'],
-                  float(stats['avg_speed_kmh']), float(stats['max_speed_kmh']), self.current_lat, self.current_lon)
+        # Letzte Aktualisierung in die DB
+        update_trip_entry(self.trip_id, end_time, float(stats['dist_km']), stats['time_str'],
+                          float(stats['avg_speed_kmh']), float(stats['max_speed_kmh']), self.current_lat, self.current_lon)
         self.gps_status_text = "Fahrt gespeichert!"
 
     @mainthread
@@ -285,6 +310,11 @@ class TrackerEngine:
 
                 if self.current_speed_kmh > self.max_speed_kmh:
                     self.max_speed_kmh = self.current_speed_kmh
+
+                # AUTO-SAVE: Kontinuierlich jeden Meter in die Datenbank sichern
+                stats = self.get_stats()
+                update_trip_entry(self.trip_id, time.time(), float(stats['dist_km']), stats['time_str'],
+                                  float(stats['avg_speed_kmh']), float(stats['max_speed_kmh']), self.current_lat, self.current_lon)
             else:
                 self.current_speed_kmh = 0.0
         else:
@@ -349,7 +379,6 @@ class DashboardScreen(Screen):
         speed_card.add_widget(lbl_unit)
         root.add_widget(speed_card)
 
-        # ECHTE LIVE-STRASSENKARTE (OpenStreetMap via MapView)
         self.live_map = LiveTrackingMap(size_hint_y=0.32)
         root.add_widget(self.live_map)
 

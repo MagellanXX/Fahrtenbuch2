@@ -35,7 +35,7 @@ orientation = portrait
 fullscreen = 0
 
 # (list) Permissions
-android.permissions = ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,INTERNET,WAKE_LOCK
+android.permissions = ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,INTERNET,WAKE_LOCK,FOREGROUND_SERVICE,POST_NOTIFICATIONS
 
 # (int) Target Android API
 android.api = 33
