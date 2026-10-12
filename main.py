@@ -12,11 +12,23 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
 from kivy.uix.button import Button
+from kivy.uix.widget import Widget
 from kivy.uix.recycleview import RecycleView
 from kivy.uix.screenmanager import ScreenManager, Screen
-from kivy.graphics import Color, RoundedRectangle, Line
+from kivy.graphics import Color, RoundedRectangle, Line, Ellipse
 
-from kivy_garden.mapview import MapView, MapMarker, MapLayer
+# --- SICHERER MAPVIEW IMPORT (MIT FALLBACK) ---
+HAS_MAPVIEW = False
+try:
+    try:
+        from kivy_garden.mapview import MapView, MapMarker, MapLayer
+        HAS_MAPVIEW = True
+    except ImportError:
+        from mapview import MapView, MapMarker, MapLayer
+        HAS_MAPVIEW = True
+except Exception as map_err:
+    print(f"MapView Import Error (Fallback aktiv): {map_err}")
+    HAS_MAPVIEW = False
 
 # --- NATIVE ANDROID INTEGRATION (PYJNIUS) ---
 if platform == 'android':
@@ -65,7 +77,7 @@ if platform == 'android':
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "trips.db")
 
-# --- SQLITE DATENBANK MIT TRANSAKTIONSSICHERHEIT ---
+# --- SQLITE DATENBANK ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -134,60 +146,112 @@ class CardBox(BoxLayout):
             Color(*self.bg_color)
             RoundedRectangle(pos=self.pos, size=self.size, radius=[12])
 
-class RouteLineLayer(MapLayer):
+# --- FALLBACK RADAR WIDGET ---
+class VisualRouteRadar(Widget):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.coordinates = []
-
-    def add_point(self, lat, lon):
-        self.coordinates.append((lat, lon))
-        self.reposition()
-
-    def clear(self):
-        self.coordinates = []
-        self.canvas.clear()
-
-    def reposition(self):
-        if len(self.coordinates) < 2:
-            self.canvas.clear()
-            return
-
-        mapview = self.parent
-        pts = []
-        for lat, lon in self.coordinates:
-            x, y = mapview.get_window_xy_from(lat, lon, mapview.zoom)
-            pts.extend([x, y])
-
-        self.canvas.clear()
-        with self.canvas:
-            Color(0.9, 0.25, 0.28, 0.9)  # MagellanX Rot
-            Line(points=pts, width=3.5)
-
-class LiveTrackingMap(MapView):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.zoom = 15
-        self.lat = 53.33
-        self.lon = 8.48
-        self.current_marker = None
-        self.route_layer = RouteLineLayer()
-        self.add_layer(self.route_layer)
+        self.points = []
+        self.bind(pos=self.redraw, size=self.redraw)
 
     def update_position(self, lat, lon):
-        self.center_on(lat, lon)
-        if not self.current_marker:
-            self.current_marker = MapMarker(lat=lat, lon=lon)
-            self.add_marker(self.current_marker)
-        else:
-            self.current_marker.lat = lat
-            self.current_marker.lon = lon
-        self.route_layer.add_point(lat, lon)
+        self.points.append((lat, lon))
+        self.redraw()
 
     def clear_route(self):
-        self.route_layer.clear()
-        if self.current_marker:
-            self.remove_marker(self.current_marker)
+        self.points = []
+        self.redraw()
+
+    def redraw(self, *args):
+        self.canvas.clear()
+        with self.canvas:
+            Color(0.10, 0.12, 0.16, 1)
+            RoundedRectangle(pos=self.pos, size=self.size, radius=[12])
+
+            Color(0.18, 0.23, 0.32, 0.8)
+            Line(rectangle=(self.x + 8, self.y + 8, self.width - 16, self.height - 16), width=1.2)
+            Line(points=[self.x + 8, self.center_y, self.right - 8, self.center_y], width=1, dash_offset=4, dash_length=4)
+            Line(points=[self.center_x, self.y + 8, self.center_x, self.top - 8], width=1, dash_offset=4, dash_length=4)
+
+            if len(self.points) < 2:
+                Color(0.15, 0.78, 0.45, 1)
+                Ellipse(pos=(self.center_x - 6, self.center_y - 6), size=(12, 12))
+                return
+
+            lats = [p[0] for p in self.points]
+            lons = [p[1] for p in self.points]
+            min_lat, max_lat = min(lats), max(lats)
+            min_lon, max_lon = min(lons), max(lons)
+            d_lat = max(max_lat - min_lat, 0.0001)
+            d_lon = max(max_lon - min_lon, 0.0001)
+
+            pad = 20
+            w = self.width - 2 * pad
+            h = self.height - 2 * pad
+            canvas_pts = []
+            for lat, lon in self.points:
+                px = self.x + pad + ((lon - min_lon) / d_lon) * w
+                py = self.y + pad + ((lat - min_lat) / d_lat) * h
+                canvas_pts.extend([px, py])
+
+            Color(0.9, 0.25, 0.28, 1)
+            Line(points=canvas_pts, width=3.0)
+            Color(0.22, 0.65, 0.95, 1)
+            Ellipse(pos=(canvas_pts[-2] - 6, canvas_pts[-1] - 6), size=(12, 12))
+
+# --- ECHTE MAPVIEW (NUR WENN VERFÜGBAR) ---
+if HAS_MAPVIEW:
+    class RouteLineLayer(MapLayer):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.coordinates = []
+
+        def add_point(self, lat, lon):
+            self.coordinates.append((lat, lon))
+            self.reposition()
+
+        def clear(self):
+            self.coordinates = []
+            self.canvas.clear()
+
+        def reposition(self):
+            if len(self.coordinates) < 2:
+                self.canvas.clear()
+                return
+            mapview = self.parent
+            pts = []
+            for lat, lon in self.coordinates:
+                x, y = mapview.get_window_xy_from(lat, lon, mapview.zoom)
+                pts.extend([x, y])
+            self.canvas.clear()
+            with self.canvas:
+                Color(0.9, 0.25, 0.28, 0.9)
+                Line(points=pts, width=3.5)
+
+    class LiveTrackingMap(MapView):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.zoom = 15
+            self.lat = 53.33
+            self.lon = 8.48
             self.current_marker = None
+            self.route_layer = RouteLineLayer()
+            self.add_layer(self.route_layer)
+
+        def update_position(self, lat, lon):
+            self.center_on(lat, lon)
+            if not self.current_marker:
+                self.current_marker = MapMarker(lat=lat, lon=lon)
+                self.add_marker(self.current_marker)
+            else:
+                self.current_marker.lat = lat
+                self.current_marker.lon = lon
+            self.route_layer.add_point(lat, lon)
+
+        def clear_route(self):
+            self.route_layer.clear()
+            if self.current_marker:
+                self.remove_marker(self.current_marker)
+                self.current_marker = None
 
 # --- TRACKING ENGINE ---
 class TrackerEngine:
@@ -230,20 +294,25 @@ class TrackerEngine:
                 self.wake_lock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MagellanX:TrackerLock")
                 self.wake_lock.acquire()
 
-                channel_id = "magellanx_tracker"
-                notif_mgr = act.getSystemService(Context.NOTIFICATION_SERVICE)
-                channel = NotificationChannel(channel_id, "GPS Tracking Service", NotificationManager.IMPORTANCE_LOW)
-                notif_mgr.createNotificationChannel(channel)
-                builder = NotificationBuilder(act, channel_id)
-                builder.setContentTitle("MagellanX Tracker")
-                builder.setContentText("Streckenaufzeichnung laeuft...")
-                builder.setSmallIcon(act.getApplicationInfo().icon)
-                builder.setOngoing(True)
-                notif_mgr.notify(101, builder.build())
+                # Foreground Notification
+                try:
+                    channel_id = "magellanx_tracker"
+                    notif_mgr = act.getSystemService(Context.NOTIFICATION_SERVICE)
+                    channel = NotificationChannel(channel_id, "GPS Tracking Service", NotificationManager.IMPORTANCE_LOW)
+                    notif_mgr.createNotificationChannel(channel)
+                    builder = NotificationBuilder(act, channel_id)
+                    builder.setContentTitle("MagellanX Tracker")
+                    builder.setContentText("Streckenaufzeichnung läuft...")
+                    builder.setSmallIcon(act.getApplicationInfo().icon)
+                    builder.setOngoing(True)
+                    notif_mgr.notify(101, builder.build())
+                except Exception as ne:
+                    print(f"Notif Error: {ne}")
 
                 self.loc_mgr = act.getSystemService(Context.LOCATION_SERVICE)
                 self.native_listener = NativeUpdateListener(self.process_location)
 
+                # Cache prüfen
                 best_loc = None
                 for prov in ["gps", "network", "passive"]:
                     try:
@@ -262,6 +331,7 @@ class TrackerEngine:
                     acc = float(best_loc.getAccuracy()) if best_loc.hasAccuracy() else 50.0
                     self.gps_status_text = f"Live GPS: ±{int(acc)}m"
 
+                # Hardware-Listener
                 for p in ["gps", "network"]:
                     try:
                         if self.loc_mgr.isProviderEnabled(p):
@@ -430,8 +500,12 @@ class DashboardScreen(Screen):
         speed_card.add_widget(lbl_unit)
         root.add_widget(speed_card)
 
-        self.live_map = LiveTrackingMap(size_hint_y=0.32)
-        root.add_widget(self.live_map)
+        # Sichere Kartenauswahl: MapView falls geladen, sonst Fallback-Radar
+        if HAS_MAPVIEW:
+            self.map_widget = LiveTrackingMap(size_hint_y=0.32)
+        else:
+            self.map_widget = VisualRouteRadar(size_hint_y=0.32)
+        root.add_widget(self.map_widget)
 
         grid = GridLayout(cols=2, spacing=8, size_hint_y=0.22)
         c_dist = CardBox()
@@ -451,4 +525,146 @@ class DashboardScreen(Screen):
 
         c_max = CardBox()
         c_max.add_widget(Label(text="MAX TEMPO", font_size='10sp', bold=True, color=(0.55, 0.6, 0.7, 1), size_hint_y=0.3))
-        self.val
+        self.val_max = Label(text="0.0 km/h", font_size='17sp', bold=True, color=(0.95, 0.95, 0.95, 1), size_hint_y=0.7)
+        c_max.add_widget(self.val_max)
+
+        grid.add_widget(c_dist)
+        grid.add_widget(c_time)
+        grid.add_widget(c_avg)
+        grid.add_widget(c_max)
+        root.add_widget(grid)
+
+        self.btn_toggle = Button(text="STARTEN", font_size='18sp', bold=True, size_hint_y=0.12,
+                                 background_normal='', background_color=(0.15, 0.78, 0.45, 1))
+        self.btn_toggle.bind(on_press=self.toggle_tracking)
+        root.add_widget(self.btn_toggle)
+
+        self.add_widget(root)
+        Clock.schedule_interval(self.update_ui, 0.5)
+
+    def toggle_tracking(self, instance):
+        if not self.tracker.is_tracking:
+            self.map_widget.clear_route()
+            self.tracker.start()
+            self.btn_toggle.text = "STOPPEN & SPEICHERN"
+            self.btn_toggle.background_color = (0.9, 0.25, 0.28, 1)
+        else:
+            self.tracker.stop()
+            self.btn_toggle.text = "STARTEN"
+            self.btn_toggle.background_color = (0.15, 0.78, 0.45, 1)
+
+    def update_ui(self, dt):
+        stats = self.tracker.get_stats()
+        self.lbl_gps_status.text = stats['status']
+        if self.tracker.is_tracking:
+            self.val_speed.text = stats['speed_kmh']
+            self.val_dist.text = f"{stats['dist_km']} km"
+            self.val_time.text = stats['time_str']
+            self.val_avg.text = f"{stats['avg_speed_kmh']} km/h"
+            self.val_max.text = f"{stats['max_speed_kmh']} km/h"
+
+            if self.tracker.current_lat != 0.0:
+                self.map_widget.update_position(self.tracker.current_lat, self.tracker.current_lon)
+
+    def go_to_history(self, instance):
+        self.manager.get_screen('history').refresh_data()
+        self.manager.current = 'history'
+
+# --- HISTORIE SCREEN ---
+class HistoryScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.root_box = BoxLayout(orientation='vertical', padding=14, spacing=10)
+        with self.root_box.canvas.before:
+            Color(0.07, 0.08, 0.11, 1)
+            self.bg = RoundedRectangle(pos=self.root_box.pos, size=self.root_box.size)
+        self.root_box.bind(pos=lambda i, v: setattr(self.bg, 'pos', v), size=lambda i, v: setattr(self.bg, 'size', v))
+
+        nav_bar = BoxLayout(size_hint_y=0.08)
+        btn_back = Button(text="⬅ Zurück", size_hint_x=0.3, font_size='13sp', bold=True,
+                          background_normal='', background_color=(0.2, 0.25, 0.35, 1))
+        btn_back.bind(on_press=self.go_back)
+        title = Label(text="FAHRTEN-HISTORIE", font_size='18sp', bold=True, color=(0.95, 0.96, 0.98, 1))
+        nav_bar.add_widget(btn_back)
+        nav_bar.add_widget(title)
+        self.root_box.add_widget(nav_bar)
+
+        self.scroll_layout = GridLayout(cols=1, spacing=10, size_hint_y=None)
+        self.scroll_layout.bind(minimum_height=self.scroll_layout.setter('height'))
+
+        self.rv = RecycleView(size_hint_y=0.92)
+        self.rv.add_widget(self.scroll_layout)
+        self.root_box.add_widget(self.rv)
+
+        self.add_widget(self.root_box)
+
+    def refresh_data(self):
+        self.scroll_layout.clear_widgets()
+        trips = get_all_trips()
+
+        if not trips:
+            empty_lbl = Label(text="Noch keine Fahrten gespeichert.", color=(0.5, 0.55, 0.65, 1), size_hint_y=None, height=60)
+            self.scroll_layout.add_widget(empty_lbl)
+            return
+
+        current_month = None
+        for trip in trips:
+            date, s_time, e_time, dist, dur, avg_spd, max_spd, lat, lon = trip
+            try:
+                t_obj = datetime.datetime.strptime(date, "%Y-%m-%d")
+                month_str = t_obj.strftime("%B %Y")
+            except Exception:
+                month_str = date
+
+            if month_str != current_month:
+                current_month = month_str
+                m_header = Label(text=f"📅 {current_month}", font_size='15sp', bold=True,
+                                 color=(0.9, 0.25, 0.28, 1), size_hint_y=None, height=35)
+                self.scroll_layout.add_widget(m_header)
+
+            card = CardBox(size_hint_y=None, height=80)
+            line1 = BoxLayout()
+            line1.add_widget(Label(text=f"{date}  ({s_time} - {e_time})", bold=True, font_size='13sp', color=(1, 1, 1, 1)))
+            line1.add_widget(Label(text=f"{dist:.2f} km", bold=True, font_size='15sp', color=(0.15, 0.78, 0.45, 1)))
+
+            line2 = BoxLayout()
+            line2.add_widget(Label(text=f"Dauer: {dur} | Ø {avg_spd:.1f} km/h", font_size='11sp', color=(0.6, 0.65, 0.75, 1)))
+            
+            if lat and lon and lat != 0.0:
+                btn_map = Button(text="In Maps ➔", size_hint_x=0.32, font_size='11sp', bold=True,
+                                 background_normal='', background_color=(0.2, 0.55, 0.9, 0.85))
+                btn_map.bind(on_press=lambda inst, la=lat, lo=lon: webbrowser.open(f"https://www.google.com/maps/search/?api=1&query={la},{lo}"))
+                line2.add_widget(btn_map)
+
+            card.add_widget(line1)
+            card.add_widget(line2)
+            self.scroll_layout.add_widget(card)
+
+    def go_back(self, instance):
+        self.manager.current = 'dashboard'
+
+# --- MAIN APP ---
+class GPSApp(App):
+    def build(self):
+        init_db()
+        self.tracker = TrackerEngine()
+
+        if platform == 'android':
+            request_permissions([
+                Permission.ACCESS_FINE_LOCATION,
+                Permission.ACCESS_COARSE_LOCATION
+            ], self.permission_callback)
+
+        sm = ScreenManager()
+        sm.add_widget(DashboardScreen(self.tracker, name='dashboard'))
+        sm.add_widget(HistoryScreen(name='history'))
+        return sm
+
+    def permission_callback(self, permissions, results):
+        if all([res for res in results]):
+            self.tracker.gps_status_text = "GPS: Bereit"
+        else:
+            self.tracker.gps_status_text = "GPS: Zugriff verweigert!"
+
+if __name__ == '__main__':
+    GPSApp().run()

@@ -20,7 +20,7 @@ version = 0.4
 
 # (list) Application requirements
 # mapview benoetigt requests, urllib3, certifi fuer den Online-Download der Kartenkacheln
-requirements = python3,kivy==2.3.0,pyjnius,requests,urllib3,certifi,mapview
+requirements = python3,kivy==2.3.0,pyjnius,requests,urllib3,certifi,kivy_garden.mapview,openssl
 
 # (str) Presplash of the application
 presplash.filename = presplash.png
